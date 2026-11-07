@@ -3,6 +3,12 @@
 A small desktop app (and command-line tool) for running a local LLM through
 [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`, written in Rust.
 
+<p align="center">
+  <a href="docs/media/intro.mp4"><img src="docs/media/intro.jpg" alt="LLM Switch intro video. A 35-billion-parameter model. A 12 GB graphics card." width="720"></a>
+  <br>
+  <sub>21-second intro: click to play. Music: Sascha Ende, ende.app (CC BY 4.0)</sub>
+</p>
+
 - **One-click start / stop / switch** for any `.gguf` model in a folder.
 - **Per-model settings** (context size, GPU layers, MoE expert offload, KV-cache type, ...) kept in one config file.
 - **OpenCode sync**: writes the model's context limit and compaction buffer into `opencode.json` on every start.
@@ -405,6 +411,10 @@ The flags the app passes to `llama-server` are built as:
 The server is started as a separate process, so it keeps running if you close the window. Use **Stop** (or
 `llm-switch-cli stop`) to shut it down.
 
+**Resource use.** The window itself is light: measured on Windows, it uses about 73 MB of RAM with no server running
+(about 78 MB with one running) and well under 1% of the CPU when idle. The memory and GPU go to `llama-server`, which
+is the model itself.
+
 ---
 
 ## 7. Command-line reference
@@ -680,6 +690,11 @@ redistribute built binaries, you may want to ship those notices with them. To re
 cargo install cargo-license
 cargo license
 ```
+
+**The intro video** (`docs/media/intro.mp4`) has a music track, "Happy Beats / Business Moves Vol. 12" by Sascha Ende
+([ende.app](https://ende.app/en)), licensed [CC BY 4.0](https://ende.app/en/standard-license). That audio is not covered
+by this project's MIT license and needs the credit "Music: Sascha Ende, ende.app (CC BY 4.0)" wherever the video is
+shown. The sound effects in it are CC0 (Kenney.nl).
 
 **Not included.** LLM Switch does not bundle llama.cpp (MIT) or any model. Models are covered by their own licenses;
 check the terms of each `.gguf` you download.
