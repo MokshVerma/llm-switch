@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 /// Resolved launch settings for one model (defaults merged with per-model overrides).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub ctx: u32,
     pub ngl: u32,
@@ -19,10 +20,12 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
+        // Conservative values that start on most machines; per-model overrides (written by the
+        // downloader and the auto-tuner) are what make a model fast.
         Self {
-            ctx: 131072,
+            ctx: 32768,
             ngl: 99,
-            n_cpu_moe: Some(28),
+            n_cpu_moe: None,
             flash_attn: true,
             cache_type_k: Some("q8_0".into()),
             cache_type_v: Some("q8_0".into()),
@@ -77,7 +80,9 @@ pub struct Config {
     pub opencode: OpenCodeCfg,
     #[serde(default)]
     pub defaults: Settings,
-    #[serde(default, rename = "model")]
+    // An empty list is not written at all: a stray `model = []` line would clash with a `[[model]]` block
+    // that someone adds by hand later.
+    #[serde(default, rename = "model", skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelCfg>,
 }
 
@@ -98,12 +103,7 @@ impl Default for Config {
                 compaction_buffer: Some(10000),
             },
             defaults: Settings::default(),
-            models: vec![ModelCfg {
-                file: "Qwen3.5-35B-A3B-heretic-Q4_K_M.gguf".into(),
-                name: Some("Qwen3.5 35B-A3B heretic".into()),
-                opencode_id: Some("qwen35-heretic".into()),
-                overrides: Overrides::default(),
-            }],
+            models: vec![],
         }
     }
 }
@@ -149,6 +149,20 @@ impl Config {
             fs::create_dir_all(dir)?;
         }
         fs::write(&path, toml::to_string_pretty(self)?).with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// True if `file` already has its own `[[model]]` block.
+    pub fn has_model(&self, file: &str) -> bool {
+        self.models.iter().any(|m| m.file.eq_ignore_ascii_case(file))
+    }
+
+    /// Creates a `[[model]]` block for `file` with these settings and saves. Does nothing if one exists.
+    pub fn add_model(&mut self, file: &str, overrides: Overrides) -> Result<()> {
+        if self.has_model(file) {
+            return Ok(());
+        }
+        self.models.push(ModelCfg { file: file.into(), name: None, opencode_id: None, overrides });
+        self.save()
     }
 
     /// Stores tuned values as per-model overrides (creating the model's block if needed) and saves.

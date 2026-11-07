@@ -151,7 +151,10 @@ pub fn stop() -> Result<usize> {
 /// Stops any running server, then launches `model` detached with its configured flags. Returns the PID.
 pub fn start(cfg: &Config, model: &Model) -> Result<u32> {
     if !cfg.llama_server.exists() {
-        return Err(anyhow!("llama-server not found at {}", cfg.llama_server.display()));
+        return Err(anyhow!(
+            "llama-server not found at {}. Open the Setup tab to install it, or run `llm-switch-cli install-llama`",
+            cfg.llama_server.display()
+        ));
     }
     if !model.path.exists() {
         return Err(anyhow!("model file not found: {}", model.path.display()));

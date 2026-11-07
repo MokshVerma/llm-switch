@@ -8,6 +8,94 @@ use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Os {
+    Windows,
+    MacOs,
+    Linux,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arch {
+    X64,
+    Arm64,
+    Other,
+}
+
+pub fn os() -> Os {
+    if cfg!(windows) {
+        Os::Windows
+    } else if cfg!(target_os = "macos") {
+        Os::MacOs
+    } else {
+        Os::Linux
+    }
+}
+
+/// CPU architecture this program was built for. See `apple_silicon` for Macs running x86_64 code under Rosetta.
+pub fn arch() -> Arch {
+    if cfg!(target_arch = "x86_64") {
+        Arch::X64
+    } else if cfg!(target_arch = "aarch64") {
+        Arch::Arm64
+    } else {
+        Arch::Other
+    }
+}
+
+/// True on an Apple Silicon Mac, even when this process is an Intel build running under Rosetta.
+pub fn apple_silicon() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        run_capture("sysctl", &["-n", "hw.optional.arm64"]).is_some_and(|s| s.trim() == "1")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Runs a program and returns its stdout if it exited successfully. Never shows a console window.
+pub fn run_capture(program: &str, args: &[&str]) -> Option<String> {
+    let mut cmd = Command::new(program);
+    let out = hide_console(cmd.args(args)).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Names of the display adapters the OS knows about, for choosing a llama.cpp backend.
+pub fn display_adapters() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        run_capture(
+            "powershell",
+            &["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }"],
+        )
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        run_capture("system_profiler", &["SPDisplaysDataType"])
+            .map(|s| {
+                s.lines()
+                    .filter_map(|l| l.trim().strip_prefix("Chipset Model:").map(|n| n.trim().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        run_capture("lspci", &[])
+            .map(|s| {
+                s.lines()
+                    .filter(|l| l.contains("VGA compatible controller") || l.contains("3D controller"))
+                    .filter_map(|l| l.splitn(3, ':').nth(2).map(|n| n.trim().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 /// File name of llama.cpp's server binary.
 pub const SERVER_EXE: &str = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
 
@@ -47,32 +135,50 @@ pub struct DefaultPaths {
     pub log_file: PathBuf,
 }
 
-pub fn default_paths() -> DefaultPaths {
+/// Where large downloads live: bigger than a config file, and not something that should roam between machines.
+pub fn data_dir() -> PathBuf {
     #[cfg(windows)]
     {
-        DefaultPaths {
-            llama_server: PathBuf::from(r"D:\llama.cpp\llama-server.exe"),
-            models_dir: PathBuf::from(r"D:\models"),
-            log_file: PathBuf::from(r"D:\llama.cpp\server.log"),
-        }
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| home_dir().join("AppData").join("Local")).join("llm-switch")
     }
     #[cfg(target_os = "macos")]
     {
-        DefaultPaths {
-            // Homebrew's `brew install llama.cpp` location on Apple Silicon.
-            llama_server: PathBuf::from("/opt/homebrew/bin/llama-server"),
-            models_dir: home_dir().join("models"),
-            log_file: home_dir().join("Library").join("Logs").join("llm-switch").join("server.log"),
-        }
+        config_dir()
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        DefaultPaths {
-            llama_server: home_dir().join("llama.cpp").join("build").join("bin").join("llama-server"),
-            models_dir: home_dir().join("models"),
-            log_file: config_dir().join("server.log"),
-        }
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join(".local").join("share"))
+            .join("llm-switch")
     }
+}
+
+/// Searches the folders on PATH for `name`.
+pub fn find_in_path(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?).map(|dir| dir.join(name)).find(|p| p.is_file())
+}
+
+/// Where the app installs llama.cpp when the user lets it.
+pub fn default_llama_dir() -> PathBuf {
+    data_dir().join("llama.cpp")
+}
+
+pub fn default_paths() -> DefaultPaths {
+    // Prefer a llama-server that is already on this machine: on PATH, or where a package manager puts it.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    candidates.extend(find_in_path(SERVER_EXE));
+    candidates.push(default_llama_dir().join(SERVER_EXE));
+    #[cfg(target_os = "macos")]
+    candidates.extend(["/opt/homebrew/bin/llama-server", "/usr/local/bin/llama-server"].map(PathBuf::from));
+    #[cfg(all(unix, not(target_os = "macos")))]
+    candidates.extend([
+        PathBuf::from("/usr/local/bin/llama-server"),
+        home_dir().join("llama.cpp").join("build").join("bin").join("llama-server"),
+    ]);
+    let llama_server = candidates.iter().find(|p| p.is_file()).cloned().unwrap_or_else(|| default_llama_dir().join(SERVER_EXE));
+
+    DefaultPaths { llama_server, models_dir: home_dir().join("models"), log_file: data_dir().join("server.log") }
 }
 
 /// Windows paths are case-insensitive; elsewhere they are not.

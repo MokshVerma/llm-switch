@@ -44,7 +44,9 @@ It ships as two programs built from the same code:
 
 ## 1. What you need to run it
 
-LLM Switch does not include a model or an inference engine. You need:
+LLM Switch does not include a model or an inference engine. You need two things, and **the app can fetch both for
+you**: on a first run it opens on the **Setup** tab, detects your hardware, installs the right llama.cpp build, and
+downloads a model from a link you paste. See [First run: the Setup tab](#first-run-the-setup-tab). To do it by hand:
 
 1. **`llama-server`** from llama.cpp.
    - **Windows:** download a release zip from <https://github.com/ggml-org/llama.cpp/releases>. For an NVIDIA GPU
@@ -244,8 +246,8 @@ own artwork, replace `assets/icon.icns` with any valid `.icns` file and rebuild 
 
 ## 4. Build on Linux (untested)
 
-The code has a Linux branch (`xdg-open`, `lsof`, `nvidia-smi`, `~/.config/llm-switch`) and
-`cargo check --target x86_64-unknown-linux-gnu` passes, but it has never been run.
+The code has a Linux branch (`xdg-open`, `lsof`, `lspci`, `nvidia-smi`, `~/.config/llm-switch`). Its OS-specific
+modules type-check for `x86_64-unknown-linux-gnu`, but it has never been run.
 
 ```bash
 # Debian / Ubuntu
@@ -270,26 +272,83 @@ On first launch the app writes a default config file and uses it from then on.
 Set the environment variable **`LLM_SWITCH_CONFIG`** to use a different file. `llm-switch-cli config` prints the
 path in use, and the window's **Open config** button opens it in your editor.
 
+### First run: the Setup tab
+
+A first run (or a missing llama-server or model) opens the window on the **Setup** tab. Everything in it is also
+available from the command line (see [Command-line reference](#7-command-line-reference)).
+
+**1. This machine.** The app looks at your OS, CPU architecture, RAM, and GPUs: for NVIDIA it reads the driver
+version and compute capability from `nvidia-smi`; AMD, Intel and Apple GPUs come from the OS.
+
+**2. llama.cpp.** If `llama-server` is already on your PATH, or where a package manager puts it, the app uses that.
+Otherwise it looks through the newest [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) for the
+build that fits this machine:
+
+| Machine | Build |
+|---|---|
+| Windows, NVIDIA, driver 580+ and a Turing-or-newer card (RTX 20 series and later) | CUDA 13.x, plus its CUDA runtime archive |
+| Windows, NVIDIA, driver 527 to 579, **or** an older card (GTX 10 series and earlier) | CUDA 12.x, plus its runtime archive |
+| Windows, NVIDIA driver older than 527 | Vulkan, with a note recommending a driver update |
+| Windows, AMD or Intel GPU | Vulkan |
+| Windows, no GPU | CPU |
+| Windows on ARM | CPU (arm64) |
+| macOS, Apple Silicon / Intel | Metal (arm64 / x64) |
+| Linux, with a GPU / without | Vulkan / CPU. For CUDA or ROCm on Linux, build llama.cpp yourself and set `llama_server`. |
+
+The download is checked against GitHub's published SHA-256 when there is one, unpacked (entries that try to escape
+the install folder are skipped), and then **started once with `--version`** to prove it works. If Windows reports a
+missing DLL, the message says to install the Microsoft Visual C++ Redistributable. The install goes to
+`%LOCALAPPDATA%\llm-switch\llama.cpp` (Windows), `~/Library/Application Support/llm-switch/llama.cpp` (macOS) or
+`~/.local/share/llm-switch/llama.cpp` (Linux) unless you pick another folder, and the config is pointed at it.
+It does not need administrator rights.
+
+**3. A model.** Paste any of these into the link box and press **Look up**:
+
+| You paste | What happens |
+|---|---|
+| A Hugging Face repository (`https://huggingface.co/owner/model-GGUF` or `owner/model-GGUF`) | Lists its `.gguf` files with sizes so you can pick a quantization. Split models are grouped into one entry. |
+| A Hugging Face file page (`.../blob/main/model-Q4_K_M.gguf`) | Downloads that file. |
+| A direct link to a `.gguf` file on any site | Downloads that file. |
+
+Downloads go into `models_dir` and:
+
+- **resume** if interrupted (the partial file is kept as `<name>.part`; cancelling also keeps it),
+- are verified against Hugging Face's SHA-256 and expected size, and must start with the `GGUF` magic number (so a
+  login page saved by mistake is rejected rather than kept),
+- check that the drive has enough free space (plus a 1 GB margin) before starting,
+- only ever write a plain file name inside `models_dir`; a name like `..\..\x.gguf` is refused.
+
+Gated or private Hugging Face models need a token: set the `HF_TOKEN` environment variable (or
+`HUGGING_FACE_HUB_TOKEN`) and restart the app. It is read from the environment only, never written to disk, and
+is sent to `huggingface.co` hosts only, not to the download servers a request is redirected to.
+
+**Starting settings.** When a download finishes, the app adds a `[[model]]` block with estimated settings, unless
+you already configured that file. The estimate uses the model's size and layer count and your GPU's memory:
+context starts at 32K (or the model's own limit if smaller); a model that fits in GPU memory runs fully on the GPU;
+a Mixture-of-Experts model keeps just enough expert layers in RAM; a dense model that is too big offloads as many
+layers as fit. These are **estimates, deliberately a little cautious**, calibrated against a 12 GB RTX 3060 running a
+19.7 GB, 40-layer MoE model. Run **Auto-tune** to replace them with measured values for this machine.
+
 ### Default paths written on first run
 
 | Setting | Windows | macOS | Linux |
 |---|---|---|---|
-| `llama_server` | `D:\llama.cpp\llama-server.exe` | `/opt/homebrew/bin/llama-server` | `~/llama.cpp/build/bin/llama-server` |
-| `models_dir` | `D:\models` | `~/models` | `~/models` |
-| `log_file` | `D:\llama.cpp\server.log` | `~/Library/Logs/llm-switch/server.log` | `~/.config/llm-switch/server.log` |
+| `llama_server` | a `llama-server` found on PATH or in a standard place, otherwise the Setup install folder: `%LOCALAPPDATA%\llm-switch\llama.cpp\llama-server.exe` | PATH, `/opt/homebrew/bin`, `/usr/local/bin`, otherwise `~/Library/Application Support/llm-switch/llama.cpp/llama-server` | PATH, `/usr/local/bin`, `~/llama.cpp/build/bin`, otherwise `~/.local/share/llm-switch/llama.cpp/llama-server` |
+| `models_dir` | `C:\Users\<you>\models` | `~/models` | `~/models` |
+| `log_file` | `%LOCALAPPDATA%\llm-switch\server.log` | `~/Library/Application Support/llm-switch/server.log` | `~/.local/share/llm-switch/server.log` |
 | OpenCode config | `%USERPROFILE%\.config\opencode\opencode.json` | `~/.config/opencode/opencode.json` | same |
 
-**These are guesses. Edit them first.** The default config also contains a `[[model]]` block for
-`Qwen3.5-35B-A3B-heretic-Q4_K_M.gguf`, which was the author's model; replace or delete it.
+All of these can be changed in the config. If OpenCode is not installed (no `opencode.json`), the sync is simply
+skipped.
 
 ### Config reference
 
 ```toml
-llama_server = 'D:\llama.cpp\llama-server.exe'   # path to llama-server
-models_dir   = 'D:\models'                        # every .gguf in here is listed (not recursive)
+llama_server = 'C:\Users\you\AppData\Local\llm-switch\llama.cpp\llama-server.exe'   # path to llama-server
+models_dir   = 'C:\Users\you\models'              # every .gguf in here is listed (not recursive)
 host         = "127.0.0.1"
 port         = 8080
-log_file     = 'D:\llama.cpp\server.log'          # server output goes here; the Log tab shows its tail
+log_file     = 'C:\Users\you\AppData\Local\llm-switch\server.log'   # server output goes here; the Log tab shows its tail
 
 [opencode]
 config_path       = 'C:\Users\you\.config\opencode\opencode.json'
@@ -298,10 +357,10 @@ auto_sync         = true           # write context limits to opencode.json on ev
 output_limit      = 8192           # "limit.output" written for the model
 compaction_buffer = 10000          # tokens kept free before OpenCode compacts; remove the line to leave it alone
 
-[defaults]                         # used by every model unless it overrides them
-ctx           = 131072             # -c
+[defaults]                         # used by every model unless it overrides them (these are the built-in values)
+ctx           = 32768              # -c
 ngl           = 99                 # -ngl (layers on the GPU)
-n_cpu_moe     = 28                 # --n-cpu-moe (MoE models: experts of the first N layers stay in RAM); remove for dense models
+# n_cpu_moe   = 28                 # --n-cpu-moe (MoE models: experts of the first N layers stay in RAM); leave out for dense models
 flash_attn    = true               # -fa on
 cache_type_k  = "q8_0"             # -ctk
 cache_type_v  = "q8_0"             # -ctv
@@ -340,6 +399,8 @@ The flags the app passes to `llama-server` are built as:
 - **Reload config** / **Open config**.
 - **Launch command**: expand to see the exact command line.
 - **Server log** tab: live tail of the server's output. **Auto-tune** tab: see [Auto-tune](#8-auto-tune).
+  **Setup** tab: install llama.cpp and download models, see [First run: the Setup tab](#first-run-the-setup-tab).
+  When something is missing, an amber notice at the top has an **Open Setup** button.
 
 The server is started as a separate process, so it keeps running if you close the window. Use **Stop** (or
 `llm-switch-cli stop`) to shut it down.
@@ -358,7 +419,15 @@ llm-switch-cli sync   [model]        write the model's limits into opencode.json
 llm-switch-cli args   [model]        print the llama-server command line
 llm-switch-cli config                print the config file path
 llm-switch-cli tune   [model] [--ctx 32768,65536,131072] [--headroom 700] [--apply]
+llm-switch-cli hardware              what this machine has (OS, CPU, GPU, RAM)
+llm-switch-cli setup                 what is installed and what is still missing
+llm-switch-cli install-llama [--dir DIR] [--dry-run]
+llm-switch-cli download LINK [--pick N] [--dry-run]
 ```
+
+`install-llama` and `download` do the same as the Setup tab, with progress on the terminal. `--dry-run` shows what
+would be downloaded (build, sizes, free space) without downloading anything. `download` with a repository link that
+has several files prints a numbered list and exits; run it again with `--pick N`.
 
 `[model]` is any part of the file name or display name. On Windows, the release GUI exe has no console, which is why
 the command-line tool is a separate program.
@@ -455,15 +524,22 @@ src/
   lib.rs                module list
   config.rs             config file, per-model settings, launch arguments
   server.rs             start, stop, health, HTTP helpers, log tail
-  platform.rs           every OS-specific piece, behind cfg (paths, spawning, dialogs, VRAM, connections)
+  platform.rs           every OS-specific piece, behind cfg (paths, spawning, dialogs, VRAM, connections, GPU lookup)
   opencode.rs           opencode.json sync
-  actions.rs            start/stop/toggle and "tune then restore the server"
+  actions.rs            start/stop/toggle, install llama.cpp, download a model, "tune then restore the server"
   tune.rs               the auto-tuner
   gguf.rs               minimal GGUF header reader
-  gui.rs                the window (egui / eframe)
+  hardware.rs           detects OS, CPU, GPUs (NVIDIA driver and compute capability) and RAM
+  download.rs           resumable, checksummed HTTP downloads; free-space check
+  llamacpp.rs           picks, downloads, unpacks and verifies the right llama.cpp build
+  models.rs             Hugging Face / direct links -> .gguf files on disk
+  suggest.rs            estimated starting settings for a newly downloaded model
+  gui.rs                the window (egui / eframe), including the Setup tab
 ```
 
-Design rule: **nothing outside `platform.rs` mentions an operating system.** Add new OS-specific behaviour there.
+Design rule: **no OS-specific code (`cfg` gates or system calls) outside `platform.rs`.** Add new OS-specific
+behaviour there. `llamacpp.rs` does contain the names of llama.cpp's release files (`win`, `macos`, `ubuntu`), but
+that is data about someone else's naming, kept as pure functions so it can be tested on any machine.
 
 ---
 
@@ -474,6 +550,7 @@ Design rule: **nothing outside `platform.rs` mentions an operating system.** Add
 | Builds | yes, tested | **yes, in CI** (universal `arm64` + `x86_64`) | type-checks only (`x86_64-unknown-linux-gnu`) |
 | Window, start / stop / sync | **tested** | not run | not run |
 | Auto-tune | **tested** (NVIDIA) | not available yet | untested (needs `nvidia-smi`) |
+| Setup: install llama.cpp, download a model | **tested**: installed the CUDA build, started it, downloaded and resumed a model | build selection unit-tested; nothing downloaded or run | build selection unit-tested; nothing downloaded or run |
 | `.app` bundle / icon | n/a | **built in CI**, ad-hoc signature verifies; **not launched** | n/a |
 
 ---
@@ -491,6 +568,14 @@ Design rule: **nothing outside `platform.rs` mentions an operating system.** Add
 | "... is not plain JSON" (OpenCode sync) | `opencode.json` has comments or trailing commas. Remove them, or set `auto_sync = false`. |
 | OpenCode shows the wrong context | Restart OpenCode after a sync, and make sure `-c` and `limit.context` match (they do when the app writes both). |
 | Config parse error on start | A typo in `config.toml`. The message names the line. Delete the file to regenerate the defaults. |
+| Setup: "no ready-made llama.cpp build was found" | Your OS/CPU has no prebuilt release. Build llama.cpp from source and set `llama_server` in the config. |
+| Setup: "could not start because a required DLL is missing" (Windows) | Install the [Microsoft Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe), then try again. |
+| Setup: "NVIDIA driver is too old for the CUDA builds" | The Vulkan build was installed instead. Update the NVIDIA driver (527 or newer) and reinstall for the faster CUDA build. |
+| Download: HTTP 401 or 403 | Check the repository name for typos (Hugging Face reports a missing repository as 401). For a gated model, accept its terms on the website and set `HF_TOKEN`. |
+| Download: "not a GGUF file" | The link led to a web page, not the model file. Use the repository link or the file's "resolve" link. |
+| Download: "not enough free space" | The drive holding `models_dir` is too full. Free space, or point `models_dir` at another drive. |
+| Download stopped halfway | Run the same download again: it resumes from `<name>.part`. |
+| Setup install: "checksum mismatch" | The file was corrupted in transit and has been deleted. Try again. |
 | macOS: "app is damaged" or "unidentified developer" | Gatekeeper quarantine. See [Signing, Gatekeeper and notarization](#signing-gatekeeper-and-notarization). |
 
 ---
@@ -552,18 +637,30 @@ Publishing runs in a single job after **both** builds succeed, so a failed Windo
 half-empty release. A newer push to the same branch cancels a build that is still running; nothing is lost, because
 the next run reads every commit since the last release.
 
-Check another platform's code without that platform (works from Windows):
+### Tests
 
-```powershell
-rustup target add aarch64-apple-darwin x86_64-unknown-linux-gnu
-cargo check --target aarch64-apple-darwin
-cargo check --target x86_64-unknown-linux-gnu
+```bash
+cargo test --release
 ```
 
-This only type-checks. It does not link or run anything.
+The suite has about 45 tests: the download engine against a local HTTP server (full download, resume, checksum
+and size mismatch, cancel), llama.cpp build selection against real release file names, archive extraction
+(including path-traversal entries), Hugging Face link parsing, hardware parsing, and the starting-settings estimate
+checked against measurements from a real GPU. CI runs it on Windows and on macOS before anything is built or
+published, so a failing test stops a release.
 
-There is no automated test suite yet. Behaviour was verified by running the real server through the CLI and the window.
-Useful manual checks after a change: `llm-switch-cli list`, `start`, `status`, `toggle`, and opening the window.
+What the tests do **not** cover: the window itself, and anything that needs a real GPU or a real llama-server.
+After a change to those, check by hand: `llm-switch-cli list`, `start`, `status`, `toggle`, and open the window.
+
+### Checking another platform without it
+
+The HTTPS library (`rustls`, through `ring`) compiles a little C, so `cargo check --target <mac or linux>` from a
+Windows PC fails unless you have a C cross-compiler. Two ways around that:
+
+- Let CI do it: the macOS job builds the real app on a Mac runner on every push to `main`.
+- Type-check just the OS-specific modules, which have no C dependencies, in a scratch crate that includes
+  `src/platform.rs`, `config.rs`, `gguf.rs`, `hardware.rs` and `suggest.rs` with `#[path]`. That is how the Unix
+  branches of `platform.rs` were checked for macOS and Linux from Windows.
 
 ---
 

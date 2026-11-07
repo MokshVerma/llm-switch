@@ -14,10 +14,15 @@ eframe = { version = "0.37.0", default-features = false, features = ["default_fo
 [dependencies]
 anyhow = "1.0.104"
 eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow"] }
+flate2 = "1.1.11"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
-sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
+sha2 = "0.11.1"
+sysinfo = { version = "0.40.1", default-features = false, features = ["disk", "system"] }
+tar = "0.4.46"
 toml = "1.2.1"
+ureq = "3.5.1"
+zip = { version = "9.4.1", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 embed-resource = "3.0.12"

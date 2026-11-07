@@ -100,6 +100,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # A failing test stops the release before anything is published.
+      - name: Test
+        run: cargo test --release
+
       - name: Build
         run: cargo build --release
 
@@ -140,6 +144,10 @@ jobs:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
+
+      # Runs the Unix code paths (archive extraction, path handling, downloads) on a real Mac.
+      - name: Test
+        run: cargo test --release
 
       - name: Build and bundle the app
         run: ./packaging/macos/bundle.sh --universal

@@ -1,10 +1,36 @@
 use crate::config::{Config, Model, launch_args};
+use crate::download::Progress;
+use crate::hardware::{self, Hardware};
+use crate::models::{self, RemoteModel};
 use crate::server::{self, Health, Running};
-use crate::{actions, opencode, tune};
+use crate::{actions, llamacpp, opencode, platform, tune};
 use eframe::egui::{self, Color32, RichText};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+fn gb(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1e9)
+}
+
+/// Shared between the window and the worker threads that detect hardware, install and download.
+#[derive(Default)]
+struct SetupState {
+    hardware: Option<Hardware>,
+    detecting: bool,
+    plan: Option<Result<llamacpp::Plan, String>>,
+    planning: bool,
+    lookup: Option<Result<Vec<RemoteModel>, String>>,
+    looking_up: bool,
+    /// What is running right now, e.g. "Installing llama.cpp".
+    task: Option<String>,
+    progress: Option<(String, Progress)>,
+    /// How the last task ended.
+    result: Option<Result<String, String>>,
+    /// Set when a task changed the config or the models folder, so the window reloads them.
+    reload: bool,
+}
 
 #[derive(Default)]
 struct Snapshot {
@@ -24,6 +50,7 @@ struct TuneState {
 enum View {
     Log,
     Tune,
+    Setup,
 }
 
 struct App {
@@ -39,6 +66,13 @@ struct App {
     cancel: Arc<AtomicBool>,
     tune_ctx: Vec<(u32, bool)>,
     headroom: u32,
+    setup: Arc<Mutex<SetupState>>,
+    setup_cancel: Arc<AtomicBool>,
+    setup_started: bool,
+    /// Text boxes on the Setup tab.
+    setup_dir: String,
+    setup_link: String,
+    setup_pick: usize,
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -47,6 +81,8 @@ pub fn run() -> anyhow::Result<()> {
     spawn_poller(cfg.clone(), snap.clone());
 
     let models = cfg.scan_models();
+    // A first run, or a missing llama-server or model, opens on the Setup tab.
+    let needs_setup = !cfg.llama_server.is_file() || models.is_empty();
     let app = App {
         cfg,
         models,
@@ -54,11 +90,17 @@ pub fn run() -> anyhow::Result<()> {
         snap,
         msg: Arc::new(Mutex::new(String::new())),
         busy: Arc::new(Mutex::new(None)),
-        view: View::Log,
+        view: if needs_setup { View::Setup } else { View::Log },
         tune: Arc::new(Mutex::new(TuneState::default())),
         cancel: Arc::new(AtomicBool::new(false)),
         tune_ctx: tune::DEFAULT_CONTEXTS.iter().map(|&c| (c, c <= 131072)).collect(),
         headroom: tune::DEFAULT_HEADROOM_MB,
+        setup: Arc::new(Mutex::new(SetupState::default())),
+        setup_cancel: Arc::new(AtomicBool::new(false)),
+        setup_started: false,
+        setup_dir: platform::default_llama_dir().display().to_string(),
+        setup_link: String::new(),
+        setup_pick: 0,
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([620.0, 560.0]).with_min_inner_size([480.0, 420.0]),
@@ -106,7 +148,21 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn setup_needed(&self) -> bool {
+        !self.cfg.llama_server.is_file() || self.models.is_empty()
+    }
+
     fn draw(&mut self, ui: &mut egui::Ui) {
+        // A finished install or download changed the config or the models folder.
+        let reload = std::mem::take(&mut self.setup.lock().unwrap().reload);
+        if reload {
+            if let Ok(c) = Config::load() {
+                self.cfg = c;
+                self.models = self.cfg.scan_models();
+                self.selected = self.selected.min(self.models.len().saturating_sub(1));
+            }
+        }
+
         let (running, health, log) = {
             let s = self.snap.lock().unwrap();
             (s.running.clone(), s.health, s.log.clone())
@@ -133,9 +189,23 @@ impl App {
         }
         ui.separator();
 
+        if self.setup_needed() && self.view != View::Setup {
+            ui.horizontal(|ui| {
+                let what = match (self.cfg.llama_server.is_file(), self.models.is_empty()) {
+                    (false, true) => "llama.cpp and a model are not installed yet.",
+                    (false, false) => "llama.cpp is not installed yet.",
+                    _ => "You have no model yet.",
+                };
+                ui.colored_label(Color32::from_rgb(230, 170, 40), what);
+                if ui.button("Open Setup").clicked() {
+                    self.view = View::Setup;
+                }
+            });
+        }
+
         ui.label(RichText::new(format!("Models in {}", self.cfg.models_dir.display())).strong());
         if self.models.is_empty() {
-            ui.colored_label(Color32::LIGHT_RED, "No .gguf files found. Check models_dir in the config.");
+            ui.label(RichText::new("No models yet. Use the Setup tab to download one from a link.").weak());
         }
         for (i, m) in self.models.iter().enumerate() {
             let is_running = running.as_ref().is_some_and(|r| server::is_model(r, m));
@@ -231,6 +301,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.view, View::Log, "Server log");
             ui.selectable_value(&mut self.view, View::Tune, "Auto-tune");
+            ui.selectable_value(&mut self.view, View::Setup, "Setup");
         });
         match self.view {
             View::Log => {
@@ -239,7 +310,258 @@ impl App {
                 });
             }
             View::Tune => self.draw_tune(ui, selected.as_ref(), tuning),
+            View::Setup => self.draw_setup(ui),
         }
+    }
+
+    // ---- Setup tab: detect this machine, install llama.cpp, download a model -----------------------------
+
+    /// Detects the hardware and, if llama.cpp is missing, looks up the right build for it.
+    fn start_detect(&self) {
+        let state = self.setup.clone();
+        let need_llama = !self.cfg.llama_server.is_file();
+        {
+            let mut s = state.lock().unwrap();
+            s.detecting = true;
+            s.planning = need_llama;
+        }
+        std::thread::spawn(move || {
+            let hw = hardware::detect();
+            state.lock().unwrap().hardware = Some(hw.clone());
+            state.lock().unwrap().detecting = false;
+            if need_llama {
+                let plan = llamacpp::plan(&hw).map_err(|e| format!("{e:#}"));
+                let mut s = state.lock().unwrap();
+                s.plan = Some(plan);
+                s.planning = false;
+            }
+        });
+    }
+
+    fn start_plan(&self) {
+        let state = self.setup.clone();
+        let hw = state.lock().unwrap().hardware.clone();
+        let Some(hw) = hw else { return };
+        state.lock().unwrap().planning = true;
+        std::thread::spawn(move || {
+            let plan = llamacpp::plan(&hw).map_err(|e| format!("{e:#}"));
+            let mut s = state.lock().unwrap();
+            s.plan = Some(plan);
+            s.planning = false;
+        });
+    }
+
+    fn start_install(&self, plan: llamacpp::Plan) {
+        let (state, cancel) = (self.setup.clone(), self.setup_cancel.clone());
+        let mut cfg = self.cfg.clone();
+        let dir = PathBuf::from(self.setup_dir.trim());
+        cancel.store(false, Ordering::Relaxed);
+        {
+            let mut s = state.lock().unwrap();
+            s.task = Some("Installing llama.cpp".into());
+            s.progress = None;
+            s.result = None;
+        }
+        std::thread::spawn(move || {
+            let st = state.clone();
+            let mut on = move |name: &str, p: Progress| st.lock().unwrap().progress = Some((name.to_string(), p));
+            let res = actions::install_llamacpp(&mut cfg, &dir, &plan, &mut on, &cancel);
+            let mut s = state.lock().unwrap();
+            s.task = None;
+            s.progress = None;
+            s.reload = true;
+            s.result = Some(res.map_err(|e| format!("{e:#}")));
+        });
+    }
+
+    fn start_lookup(&self) {
+        let state = self.setup.clone();
+        let link = self.setup_link.clone();
+        {
+            let mut s = state.lock().unwrap();
+            s.looking_up = true;
+            s.lookup = None;
+            s.result = None;
+        }
+        std::thread::spawn(move || {
+            let found = models::lookup(&link, models::hf_token().as_deref()).map_err(|e| format!("{e:#}"));
+            let mut s = state.lock().unwrap();
+            s.lookup = Some(found);
+            s.looking_up = false;
+        });
+    }
+
+    fn start_download(&self, model: RemoteModel) {
+        let (state, cancel) = (self.setup.clone(), self.setup_cancel.clone());
+        let mut cfg = self.cfg.clone();
+        cancel.store(false, Ordering::Relaxed);
+        {
+            let mut s = state.lock().unwrap();
+            s.task = Some(format!("Downloading {}", model.title));
+            s.progress = None;
+            s.result = None;
+        }
+        std::thread::spawn(move || {
+            let st = state.clone();
+            let mut on = move |name: &str, p: Progress| st.lock().unwrap().progress = Some((name.to_string(), p));
+            let res = actions::download_model(&mut cfg, &model, &mut on, &cancel);
+            let mut s = state.lock().unwrap();
+            s.task = None;
+            s.progress = None;
+            s.reload = true;
+            s.result = Some(res.map_err(|e| format!("{e:#}")));
+        });
+    }
+
+    fn draw_setup(&mut self, ui: &mut egui::Ui) {
+        if !self.setup_started {
+            self.setup_started = true;
+            self.start_detect();
+        }
+        let (hw, plan, planning, detecting, lookup, looking_up, task, progress, result) = {
+            let s = self.setup.lock().unwrap();
+            (
+                s.hardware.clone(),
+                s.plan.clone(),
+                s.planning,
+                s.detecting,
+                s.lookup.clone(),
+                s.looking_up,
+                s.task.clone(),
+                s.progress.clone(),
+                s.result.clone(),
+            )
+        };
+        let working = task.is_some();
+        let green = Color32::from_rgb(60, 190, 90);
+        let amber = Color32::from_rgb(230, 170, 40);
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.label(RichText::new(match (&hw, detecting) {
+                (Some(h), _) => format!("This machine: {}", h.summary()),
+                (None, true) => "Looking at this machine...".to_string(),
+                (None, false) => "This machine: not detected yet".to_string(),
+            }).weak());
+            ui.add_space(4.0);
+
+            // ---- llama.cpp -------------------------------------------------------------------------
+            ui.group(|ui| {
+                ui.label(RichText::new("1. llama.cpp (the program that runs the model)").strong());
+                if self.cfg.llama_server.is_file() {
+                    ui.colored_label(green, format!("Installed: {}", self.cfg.llama_server.display()));
+                } else {
+                    ui.colored_label(amber, format!("Not found at {}", self.cfg.llama_server.display()));
+                    match (&plan, planning) {
+                        (_, true) => {
+                            ui.label("Finding the right build for this machine...");
+                        }
+                        (Some(Ok(p)), _) => {
+                            ui.label(format!("Recommended: llama.cpp {} - {}", p.release, p.backend.label()));
+                            ui.label(RichText::new(format!("Download size: {}", gb(p.total_bytes()))).weak());
+                            if let Some(n) = &p.note {
+                                ui.colored_label(amber, n);
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label("Install into:");
+                                ui.add_enabled(!working, egui::TextEdit::singleline(&mut self.setup_dir).desired_width(300.0));
+                            });
+                            if ui.add_enabled(!working, egui::Button::new("Install llama.cpp")).clicked() {
+                                self.start_install(p.clone());
+                            }
+                        }
+                        (Some(Err(e)), _) => {
+                            ui.colored_label(Color32::LIGHT_RED, e);
+                            if ui.add_enabled(hw.is_some(), egui::Button::new("Try again")).clicked() {
+                                self.start_plan();
+                            }
+                        }
+                        (None, false) => {
+                            if ui.add_enabled(hw.is_some(), egui::Button::new("Find the right build")).clicked() {
+                                self.start_plan();
+                            }
+                        }
+                    }
+                }
+            });
+            ui.add_space(4.0);
+
+            // ---- a model -----------------------------------------------------------------------------
+            ui.group(|ui| {
+                ui.label(RichText::new("2. A model").strong());
+                if self.models.is_empty() {
+                    ui.colored_label(amber, format!("No models in {}", self.cfg.models_dir.display()));
+                } else {
+                    ui.colored_label(green, format!("{} model(s) in {}", self.models.len(), self.cfg.models_dir.display()));
+                }
+                ui.label(RichText::new("Paste a Hugging Face link (a repository or one file) or a direct link to a .gguf file.").weak());
+                ui.horizontal(|ui| {
+                    let edit = ui.add_enabled(!working, egui::TextEdit::singleline(&mut self.setup_link).desired_width(360.0).hint_text("https://huggingface.co/owner/model-GGUF"));
+                    let go = ui.add_enabled(!working && !looking_up && !self.setup_link.trim().is_empty(), egui::Button::new("Look up"));
+                    if go.clicked() || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.setup_link.trim().is_empty() && !working) {
+                        self.setup_pick = 0;
+                        self.start_lookup();
+                    }
+                });
+                if looking_up {
+                    ui.label("Looking it up...");
+                }
+                match &lookup {
+                    Some(Err(e)) => {
+                        ui.colored_label(Color32::LIGHT_RED, e);
+                    }
+                    Some(Ok(found)) => {
+                        ui.label(format!("{} GGUF file(s) found. Pick one:", found.len()));
+                        egui::ScrollArea::vertical().max_height(150.0).id_salt("model_list").show(ui, |ui| {
+                            for (i, m) in found.iter().enumerate() {
+                                let size = m.total().map_or("size unknown".to_string(), gb);
+                                let shards = if m.parts.len() > 1 { format!(", {} files", m.parts.len()) } else { String::new() };
+                                ui.selectable_value(&mut self.setup_pick, i, format!("{}   ({size}{shards})", m.title));
+                            }
+                        });
+                        if let Some(m) = found.get(self.setup_pick) {
+                            if ui.add_enabled(!working, egui::Button::new(format!("Download {}", m.title))).clicked() {
+                                self.start_download(m.clone());
+                            }
+                        }
+                    }
+                    None => {}
+                }
+                if models::hf_token().is_none() {
+                    ui.label(RichText::new("Gated or private models need a Hugging Face token: set the HF_TOKEN environment variable and restart.").weak().size(11.0));
+                }
+            });
+
+            // ---- progress and outcome ----------------------------------------------------------------
+            if let Some(t) = &task {
+                ui.add_space(6.0);
+                ui.label(RichText::new(t).strong());
+                if let Some((name, p)) = &progress {
+                    let frac = p.total.filter(|t| *t > 0).map_or(0.0, |t| (p.done as f32 / t as f32).clamp(0.0, 1.0));
+                    let text = match p.total {
+                        Some(total) => format!("{name}   {} of {}   {:.1} MB/s", gb(p.done), gb(total), p.bytes_per_sec / 1e6),
+                        None => format!("{name}   {}   {:.1} MB/s", gb(p.done), p.bytes_per_sec / 1e6),
+                    };
+                    ui.add(egui::ProgressBar::new(frac).text(text).desired_width(ui.available_width().min(520.0)));
+                } else {
+                    ui.label("Starting...");
+                }
+                if ui.button("Cancel").clicked() {
+                    self.setup_cancel.store(true, Ordering::Relaxed);
+                }
+                ui.label(RichText::new("Cancelling keeps what was downloaded, so the next try resumes.").weak().size(11.0));
+            }
+            match &result {
+                Some(Ok(m)) => {
+                    ui.add_space(6.0);
+                    ui.colored_label(green, m);
+                }
+                Some(Err(e)) => {
+                    ui.add_space(6.0);
+                    ui.colored_label(Color32::LIGHT_RED, e);
+                }
+                None => {}
+            }
+        });
     }
 
     fn start_tune(&self, model: Model) {

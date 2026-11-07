@@ -1,8 +1,13 @@
 pub mod actions;
 pub mod config;
+pub mod download;
 pub mod gguf;
 pub mod gui;
+pub mod hardware;
+pub mod llamacpp;
+pub mod models;
 pub mod opencode;
 pub mod platform;
 pub mod server;
+pub mod suggest;
 pub mod tune;
