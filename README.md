@@ -16,9 +16,10 @@ It ships as two programs built from the same code:
 | `llm-switch` | the window (GUI) |
 | `llm-switch-cli` | the same actions from a terminal, for scripts and shortcuts |
 
-> **Status:** developed and tested on **Windows 11 + an NVIDIA GPU**. The macOS and Linux code paths compile
-> (`cargo check` passes for `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu`) but **have never been run on
-> real hardware**, and the macOS packaging script has only been dry-run. See [Platform support](#11-platform-support).
+> **Status:** developed and tested on **Windows 11 + an NVIDIA GPU**. The macOS build is verified in CI: GitHub's
+> macOS runner builds a universal (Apple Silicon + Intel) `LLM Switch.app` that passes `codesign --verify`. But
+> **nobody has launched it on a Mac yet**, and the Linux code has only been type-checked
+> (`cargo check` for `x86_64-unknown-linux-gnu`). See [Platform support](#11-platform-support).
 
 ---
 
@@ -129,9 +130,10 @@ $s.Save()
 
 ## 3. Build on macOS
 
-> This path has **not been run on a Mac yet**. The code type-checks for both Mac architectures and the bundling
-> script's layout has been dry-run on Windows, but nobody has launched the finished `.app`. If something breaks,
-> please report it.
+> The CI workflow has built this app successfully on a macOS runner: both binaries are universal (`arm64` and
+> `x86_64`), the bundle contains the icon and `Info.plist`, and its ad-hoc signature verifies. What has **not**
+> been done is launching it on a real Mac, so window behaviour, the Dock icon and the `lsof`/`open` calls are
+> untested. If something breaks, please report it.
 
 ### Prerequisites
 
@@ -468,10 +470,10 @@ Design rule: **nothing outside `platform.rs` mentions an operating system.** Add
 
 | | Windows | macOS | Linux |
 |---|---|---|---|
-| Builds | yes, tested | type-checks (`aarch64-apple-darwin`) | type-checks (`x86_64-unknown-linux-gnu`) |
+| Builds | yes, tested | **yes, in CI** (universal `arm64` + `x86_64`) | type-checks only (`x86_64-unknown-linux-gnu`) |
 | Window, start / stop / sync | **tested** | not run | not run |
 | Auto-tune | **tested** (NVIDIA) | not available yet | untested (needs `nvidia-smi`) |
-| `.app` bundle / icon | n/a | script dry-run only; **not built or launched** | n/a |
+| `.app` bundle / icon | n/a | **built in CI**, ad-hoc signature verifies; **not launched** | n/a |
 
 ---
 
