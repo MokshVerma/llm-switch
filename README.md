@@ -222,10 +222,9 @@ Script options:
 
 ### Build the `.app` in CI instead (no Mac needed)
 
-`.github/workflows/macos.yml` builds a universal app on a GitHub-hosted macOS runner and uploads the zip as an
-artifact. Run it from the repository's **Actions** tab, or push a tag such as `v0.1.0` to also attach the zip to a
-GitHub release. It uses the ad-hoc signature, so the Gatekeeper note above still applies. This needs the project
-to live in a GitHub repository.
+`.github/workflows/release.yml` builds the macOS app (universal) on a GitHub-hosted macOS runner, and the Windows
+exes on a Windows runner, then publishes both. See [Automated builds and releases](#automated-builds-and-releases).
+The macOS app uses the ad-hoc signature, so the Gatekeeper note above still applies.
 
 ### Using the command-line tool from a terminal
 
@@ -447,7 +446,7 @@ packaging/
   make-icns.ps1         regenerates assets/icon.icns (run on Windows)
   macos/bundle.sh       builds "LLM Switch.app" and a zip
   macos/Info.plist.in   bundle metadata template (@VERSION@ is filled in)
-.github/workflows/macos.yml   CI build of the universal .app
+.github/workflows/release.yml CI: builds Windows and macOS, publishes the releases
 src/
   main.rs               the GUI program (llm-switch)
   bin/llm-switch-cli.rs the command-line program
@@ -501,6 +500,31 @@ cargo build --release            # optimized build
 cargo run --bin llm-switch       # run the GUI from source (a console window stays open in debug builds)
 cargo run --bin llm-switch-cli -- status
 ```
+
+### Automated builds and releases
+
+The workflow `.github/workflows/release.yml` runs on GitHub's servers:
+
+| Trigger | What happens |
+|---|---|
+| **Push to `main`** (a direct push, or a pull request being merged) | Builds Windows x64 and macOS universal, then recreates the rolling **pre-release `latest`** with both zips. Its notes show the commit and version. Pushes that only touch `*.md`, `LICENSE` or the git dotfiles are skipped. |
+| **Push a tag** such as `v0.2.0` | Same builds, published as a normal numbered release with generated notes. |
+| **Run manually** (Actions tab, "Run workflow") | Builds only. The zips are kept as workflow artifacts for 90 days; nothing is released. |
+
+Release assets:
+
+- `LLM-Switch-<version>-windows-x64.zip`: `llm-switch.exe`, `llm-switch-cli.exe`, `LICENSE`, `README.md`.
+- `LLM-Switch-<version>-macos.zip`: the universal `LLM Switch.app`.
+
+`<version>` comes from `Cargo.toml`, so bump it there before tagging. To cut a numbered release:
+
+```bash
+# edit version in Cargo.toml, commit and push to main, then:
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+Publishing runs in a single job after **both** builds succeed, so a failed Windows or macOS build never produces a
+half-empty release. A newer push to the same branch cancels a build that is still running.
 
 Check another platform's code without that platform (works from Windows):
 

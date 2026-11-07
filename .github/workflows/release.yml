@@ -1,0 +1,135 @@
+name: Build and release
+
+# - Push to main (a direct push, or a merged pull request): rebuild Windows and macOS and refresh the
+#   rolling pre-release called "latest".
+# - Push a tag such as v0.2.0: build the same files and publish a normal, versioned release.
+# - Run by hand from the Actions tab: build only, files are kept as workflow artifacts and nothing is released.
+on:
+  push:
+    branches: [main]
+    # Path filters are not applied to tag pushes, so a tag always builds.
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
+      - ".gitignore"
+      - ".gitattributes"
+    tags: ["v*"]
+  workflow_dispatch:
+
+# A newer push to the same ref replaces a build that is still running.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $name = "LLM-Switch-$version-windows-x64"
+          $stage = "dist/stage/$name"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item target/release/llm-switch.exe, target/release/llm-switch-cli.exe, LICENSE, README.md $stage
+          Compress-Archive -Path $stage -DestinationPath "dist/$name.zip"
+          Get-ChildItem dist/*.zip | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: dist/*.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS universal
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build and bundle the app
+        run: ./packaging/macos/bundle.sh --universal
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-zip
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    # Only after BOTH builds succeed, and never for manual test runs.
+    needs: [windows, macos]
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l dist
+          VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')"
+
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            # Versioned release for a pushed tag.
+            if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+              gh release upload "$GITHUB_REF_NAME" dist/*.zip --clobber
+            else
+              gh release create "$GITHUB_REF_NAME" dist/*.zip \
+                --title "LLM Switch $GITHUB_REF_NAME" --generate-notes --verify-tag
+            fi
+          else
+            # Rolling pre-release for main: recreate it so it only ever holds the newest files.
+            SHORT="${GITHUB_SHA::7}"
+            cat > notes.md <<EOF
+          Automated build of \`main\` at commit [\`$SHORT\`](https://github.com/$GITHUB_REPOSITORY/commit/$GITHUB_SHA)
+          (version $VERSION). This release is replaced on every push to \`main\`; for a stable version use a numbered release.
+
+          | File | For |
+          |---|---|
+          | \`LLM-Switch-$VERSION-windows-x64.zip\` | Windows 10/11, 64-bit. Unzip and run \`llm-switch.exe\`. |
+          | \`LLM-Switch-$VERSION-macos.zip\` | macOS 11+, Apple Silicon and Intel. Ad-hoc signed: right-click the app and choose Open the first time. |
+
+          Build log: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          EOF
+            gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+            gh release create latest dist/*.zip \
+              --prerelease --target "$GITHUB_SHA" \
+              --title "Latest build (main @ $SHORT)" --notes-file notes.md
+          fi
