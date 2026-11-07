@@ -1,3 +1,6 @@
 /target
 /dist
 *.bak
+
+# Output of the /brag video workflow (large rendered files)
+/brag-output*/
