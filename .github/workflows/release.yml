@@ -167,6 +167,10 @@ jobs:
       BUMP: ${{ needs.version.outputs.bump }}
       PREVIOUS: ${{ needs.version.outputs.previous }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history, to write release notes from the commits
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -183,7 +187,16 @@ jobs:
             if gh release view "$TAG" >/dev/null 2>&1; then
               gh release upload "$TAG" dist/*.zip --clobber
             else
-              args=(--title "LLM Switch $TAG" --generate-notes)
+              # Notes come from our own script: GitHub's generator would compare against the rolling
+              # "latest" tag instead of the previous numbered release.
+              if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+                prev="$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${TAG}^" 2>/dev/null || true)"
+              else
+                prev="$PREVIOUS"
+                [[ "$prev" == "none" ]] && prev=""
+              fi
+              bash packaging/ci/release-notes.sh "$prev" "$TAG" "$GITHUB_REPOSITORY" > release-notes.md
+              args=(--title "LLM Switch $TAG" --notes-file release-notes.md)
               if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
                 args+=(--verify-tag)
               else
