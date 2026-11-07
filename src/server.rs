@@ -136,10 +136,12 @@ pub fn stop() -> Result<usize> {
             killed += 1;
         }
     }
-    let deadline = Instant::now() + Duration::from_secs(8);
+    // A server holding a large model can take several seconds to give its memory back, and longer
+    // when the machine is busy, so allow generously before calling it a failure.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while running(&mut sys).is_some() {
         if Instant::now() > deadline {
-            return Err(anyhow!("llama-server did not exit within 8 s"));
+            return Err(anyhow!("llama-server did not exit within 30 s"));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
