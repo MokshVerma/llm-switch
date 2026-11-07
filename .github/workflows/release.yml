@@ -199,7 +199,11 @@ jobs:
             if [[ "$RELEASE" == "true" ]]; then
               STATUS="This commit published the numbered release **$TAG**."
             else
-              STATUS="No numbered release: there are no \`feat\`, \`fix\` or \`perf\` commits since \`$PREVIOUS\`."
+              if [[ "$PREVIOUS" == "none" ]]; then
+                STATUS="No numbered release yet: there are no \`feat\`, \`fix\` or \`perf\` commits so far."
+              else
+                STATUS="No numbered release: there are no \`feat\`, \`fix\` or \`perf\` commits since \`$PREVIOUS\`."
+              fi
             fi
             cat > notes.md <<EOF
           Automated build of \`main\` at commit [\`$SHORT\`](https://github.com/$GITHUB_REPOSITORY/commit/$GITHUB_SHA),
