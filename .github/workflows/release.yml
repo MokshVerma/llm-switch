@@ -1,9 +1,14 @@
 name: Build and release
 
-# - Push to main (a direct push, or a merged pull request): rebuild Windows and macOS and refresh the
-#   rolling pre-release called "latest".
-# - Push a tag such as v0.2.0: build the same files and publish a normal, versioned release.
-# - Run by hand from the Actions tab: build only, files are kept as workflow artifacts and nothing is released.
+# Every push to main (a direct push, or a merged pull request) rebuilds Windows and macOS and refreshes the
+# rolling "latest" pre-release. If the commits since the last release warrant it, a numbered release is also
+# published, with its version picked from the Conventional Commit types:
+#
+#   type!: ... or a "BREAKING CHANGE:" footer -> major     feat -> minor     fix, perf -> patch
+#   docs, chore, ci, test, style, refactor, build, ... -> no numbered release
+#
+# See packaging/ci/next-version.sh for the exact rules. Pushing a v* tag by hand still publishes that tag.
+# A manual run (Actions tab) only builds; the files are kept as workflow artifacts.
 on:
   push:
     branches: [main]
@@ -16,7 +21,8 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-# A newer push to the same ref replaces a build that is still running.
+# A newer push to the same ref replaces a build that is still running. Nothing is lost: the next run looks at
+# every commit since the last release, not just the latest push.
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
@@ -25,20 +31,77 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version:
+    name: Work out the version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      release: ${{ steps.v.outputs.release }}
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      bump: ${{ steps.v.outputs.bump }}
+      previous: ${{ steps.v.outputs.previous }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the whole history and all tags, so commits since the last release can be read
+
+      - name: Pick the version
+        id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            # A tag pushed by hand is released exactly as named.
+            {
+              echo "release=true"
+              echo "version=${GITHUB_REF_NAME#v}"
+              echo "tag=$GITHUB_REF_NAME"
+              echo "bump=manual"
+              echo "previous=none"
+            } >> "$GITHUB_OUTPUT"
+          else
+            bash packaging/ci/next-version.sh | tee -a "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summary
+        shell: bash
+        env:
+          RELEASE: ${{ steps.v.outputs.release }}
+          VERSION: ${{ steps.v.outputs.version }}
+          BUMP: ${{ steps.v.outputs.bump }}
+          PREVIOUS: ${{ steps.v.outputs.previous }}
+        run: |
+          {
+            echo "### Version"
+            echo "- previous release: \`$PREVIOUS\`"
+            echo "- bump: **$BUMP**"
+            echo "- building as: \`$VERSION\`"
+            if [[ "$RELEASE" == "true" ]]; then echo "- a numbered release **will** be published"; else echo "- no numbered release (no feat, fix or perf commits since the last one)"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   windows:
     name: Windows x64
+    needs: version
     runs-on: windows-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set the version for this build
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: bash packaging/ci/set-version.sh "$VERSION"
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release
 
       - name: Package
         shell: pwsh
@@ -59,11 +122,18 @@ jobs:
 
   macos:
     name: macOS universal
+    needs: version
     runs-on: macos-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set the version for this build
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: bash packaging/ci/set-version.sh "$VERSION"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -81,9 +151,9 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: Publish release
+    name: Publish
     # Only after BOTH builds succeed, and never for manual test runs.
-    needs: [windows, macos]
+    needs: [version, windows, macos]
     if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
@@ -91,9 +161,12 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
+      RELEASE: ${{ needs.version.outputs.release }}
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: ${{ needs.version.outputs.tag }}
+      BUMP: ${{ needs.version.outputs.bump }}
+      PREVIOUS: ${{ needs.version.outputs.previous }}
     steps:
-      - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -104,22 +177,35 @@ jobs:
         run: |
           set -euo pipefail
           ls -l dist
-          VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')"
 
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            # Versioned release for a pushed tag.
-            if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-              gh release upload "$GITHUB_REF_NAME" dist/*.zip --clobber
+          # 1. A numbered release, when the commits call for one (or a tag was pushed by hand).
+          if [[ "$RELEASE" == "true" ]]; then
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release upload "$TAG" dist/*.zip --clobber
             else
-              gh release create "$GITHUB_REF_NAME" dist/*.zip \
-                --title "LLM Switch $GITHUB_REF_NAME" --generate-notes --verify-tag
+              args=(--title "LLM Switch $TAG" --generate-notes)
+              if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+                args+=(--verify-tag)
+              else
+                args+=(--target "$GITHUB_SHA") # creates the tag on this commit
+              fi
+              gh release create "$TAG" dist/*.zip "${args[@]}"
             fi
-          else
-            # Rolling pre-release for main: recreate it so it only ever holds the newest files.
+          fi
+
+          # 2. The rolling pre-release for main, recreated so it only ever holds the newest files.
+          if [[ "$GITHUB_REF_TYPE" == "branch" ]]; then
             SHORT="${GITHUB_SHA::7}"
+            if [[ "$RELEASE" == "true" ]]; then
+              STATUS="This commit published the numbered release **$TAG**."
+            else
+              STATUS="No numbered release: there are no \`feat\`, \`fix\` or \`perf\` commits since \`$PREVIOUS\`."
+            fi
             cat > notes.md <<EOF
-          Automated build of \`main\` at commit [\`$SHORT\`](https://github.com/$GITHUB_REPOSITORY/commit/$GITHUB_SHA)
-          (version $VERSION). This release is replaced on every push to \`main\`; for a stable version use a numbered release.
+          Automated build of \`main\` at commit [\`$SHORT\`](https://github.com/$GITHUB_REPOSITORY/commit/$GITHUB_SHA),
+          built as version \`$VERSION\`. $STATUS
+
+          This release is replaced on every push to \`main\`. For a stable version, use a numbered release.
 
           | File | For |
           |---|---|

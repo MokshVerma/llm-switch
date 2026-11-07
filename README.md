@@ -446,7 +446,9 @@ packaging/
   make-icns.ps1         regenerates assets/icon.icns (run on Windows)
   macos/bundle.sh       builds "LLM Switch.app" and a zip
   macos/Info.plist.in   bundle metadata template (@VERSION@ is filled in)
-.github/workflows/release.yml CI: builds Windows and macOS, publishes the releases
+.github/workflows/release.yml CI: builds Windows and macOS, picks the version, publishes the releases
+packaging/ci/next-version.sh  Conventional Commits -> next version (also runnable locally)
+packaging/ci/set-version.sh   stamps the version into Cargo.toml for a CI build
 src/
   main.rs               the GUI program (llm-switch)
   bin/llm-switch-cli.rs the command-line program
@@ -507,24 +509,48 @@ The workflow `.github/workflows/release.yml` runs on GitHub's servers:
 
 | Trigger | What happens |
 |---|---|
-| **Push to `main`** (a direct push, or a pull request being merged) | Builds Windows x64 and macOS universal, then recreates the rolling **pre-release `latest`** with both zips. Its notes show the commit and version. Pushes that only touch `*.md`, `LICENSE` or the git dotfiles are skipped. |
-| **Push a tag** such as `v0.2.0` | Same builds, published as a normal numbered release with generated notes. |
+| **Push to `main`** (a direct push, or a pull request being merged) | Builds Windows x64 and macOS universal, then recreates the rolling **pre-release `latest`** with both zips. If the commits since the last release call for it, it also publishes a **numbered release** and creates its `v` tag (see below). Pushes that only touch `*.md`, `LICENSE` or the git dotfiles are skipped. |
+| **Push a `v*` tag by hand** | Builds the same files and publishes that tag as a release, exactly as named. |
 | **Run manually** (Actions tab, "Run workflow") | Builds only. The zips are kept as workflow artifacts for 90 days; nothing is released. |
+
+#### How the version is chosen
+
+Versions follow [Semantic Versioning](https://semver.org) and are decided from
+[Conventional Commit](https://www.conventionalcommits.org) messages. The workflow reads every commit since the last
+`v*` tag, and the **highest** rule that matches wins:
+
+| Commit message | Bump | Example: `v1.4.7` becomes |
+|---|---|---|
+| `type!: ...` or a `BREAKING CHANGE:` line in the body | **major** | `v2.0.0` |
+| `feat: ...` or `feat(scope): ...` | **minor** | `v1.5.0` |
+| `fix: ...` or `perf: ...` | **patch** | `v1.4.8` |
+| `docs`, `chore`, `ci`, `test`, `style`, `refactor`, `build`, anything else | none | no numbered release |
+
+Details worth knowing:
+
+- The type must start the subject line (`feat: add X`). A `feat:` later in the line or only in the body does not count;
+  a `BREAKING CHANGE:` footer in the body does. Types are case-insensitive.
+- Merge commits and unknown types (`Merge pull request ...`, `feature:`) are ignored. **With squash-merge, the pull
+  request title becomes the commit message, so title the PR like a commit** (`fix: handle empty config`). With a
+  merge commit or rebase, the individual commits inside the PR are what count.
+- Pushes that produce no bump still refresh `latest`, built as `<last version>-dev.<commit>`.
+- **The first release:** there is no tag to bump from, so the first `feat`/`fix`/`perf` commit releases the version
+  in `Cargo.toml` as it is (`v0.1.0`). From then on, the latest tag is the source of truth.
+- `Cargo.toml` is **not** edited or committed by CI. It is stamped with the computed version on the build machine
+  only, so the files in a release carry the right version while your source keeps its old number. After a release,
+  `Cargo.toml` in `main` is just a starting point for the next first-time build; the tag is what counts.
+- To force a specific version, push the tag yourself: `git tag v2.0.0 && git push origin v2.0.0`.
+- The rules live in `packaging/ci/next-version.sh`, which you can run locally from the repository root to preview
+  the next version: `bash packaging/ci/next-version.sh`.
 
 Release assets:
 
 - `LLM-Switch-<version>-windows-x64.zip`: `llm-switch.exe`, `llm-switch-cli.exe`, `LICENSE`, `README.md`.
 - `LLM-Switch-<version>-macos.zip`: the universal `LLM Switch.app`.
 
-`<version>` comes from `Cargo.toml`, so bump it there before tagging. To cut a numbered release:
-
-```bash
-# edit version in Cargo.toml, commit and push to main, then:
-git tag v0.2.0 && git push origin v0.2.0
-```
-
 Publishing runs in a single job after **both** builds succeed, so a failed Windows or macOS build never produces a
-half-empty release. A newer push to the same branch cancels a build that is still running.
+half-empty release. A newer push to the same branch cancels a build that is still running; nothing is lost, because
+the next run reads every commit since the last release.
 
 Check another platform's code without that platform (works from Windows):
 

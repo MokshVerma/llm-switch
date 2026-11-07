@@ -96,7 +96,8 @@ cp "$GUI_PATH" "$APP/Contents/MacOS/$GUI_BIN"
 cp "$CLI_PATH" "$APP/Contents/MacOS/$CLI_BIN"
 chmod +x "$APP/Contents/MacOS/$GUI_BIN" "$APP/Contents/MacOS/$CLI_BIN"
 cp assets/icon.icns "$APP/Contents/Resources/icon.icns"
-sed "s/@VERSION@/$VERSION/g" packaging/macos/Info.plist.in > "$APP/Contents/Info.plist"
+# macOS wants a plain x.y.z in the plist, so drop any pre-release suffix such as -dev.abc1234.
+sed "s/@VERSION@/${VERSION%%[-+]*}/g" packaging/macos/Info.plist.in > "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # ---- sign ----------------------------------------------------------------------------------------
