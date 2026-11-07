@@ -1,0 +1,36 @@
+name: macOS app
+
+# Builds a universal (Apple Silicon + Intel) "LLM Switch.app" on a macOS runner.
+# Run it by hand from the Actions tab, or push a tag such as v0.1.0 to also attach the zip to a release.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  bundle:
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the app bundle
+        run: ./packaging/macos/bundle.sh --universal
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LLM-Switch-macos
+          path: dist/*.zip
+
+      - name: Attach to the GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
